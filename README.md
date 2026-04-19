@@ -69,4 +69,11 @@ Once started, open your browser at [**http://127.0.0.1:8000**](http://127.0.0.1:
 
 ---
 
+##  Demo-Friendly Features (School Presentation)
+1.  **Local Demo Mode**: If `GROQ_API_KEY` is not set or the API fails, chat still returns deterministic, medically-grounded fallback responses.
+2.  **Health Endpoint**: `GET /health` reports app status, active mode (`groq` or `local-demo`), and graph size.
+3.  **Symptom Suggestions Endpoint**: `GET /symptom-suggestions?query=head&limit=10` returns matching canonical symptoms for fast live demos.
+
+---
+
 
