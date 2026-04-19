@@ -22,7 +22,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from groq import Groq
 from dotenv import load_dotenv
@@ -53,8 +53,13 @@ print("[startup] Initialising RAG pipeline from CSV...")
 RAG = RAGPipeline(csv_path=_DOCS_CSV)
 print("[startup] Loading NLP extractor (dynamic lexicon from CSV)...")
 NLP = SymptomExtractor(csv_path=_SYMPTOM_CSV)
-print("[startup] Groq client ready.")
-GROQ = Groq(api_key=os.getenv("GROQ_API_KEY"))
+_groq_key = os.getenv("GROQ_API_KEY")
+if _groq_key:
+    GROQ = Groq(api_key=_groq_key)
+    print("[startup] Groq client ready.")
+else:
+    GROQ = None
+    print("[startup] GROQ_API_KEY not found, chat will run in local demo mode.")
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -80,18 +85,18 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[Message]
-    extracted_symptoms: Optional[List[str]] = []  # accumulate across turns
+    extracted_symptoms: Optional[List[str]] = Field(default_factory=list)  # accumulate across turns
 
 class ChatResponse(BaseModel):
     reply: str
     extracted_symptoms: List[str]
-    symptom_timeline: List[str] = []
+    symptom_timeline: List[str] = Field(default_factory=list)
     top_conditions: List[dict]
     rag_sources: List[str]
     graph_followups: List[str]
     red_flags_detected: List[str]
-    traversal_path: List[dict] = []
-    journey_edges: List[dict] = []
+    traversal_path: List[dict] = Field(default_factory=list)
+    journey_edges: List[dict] = Field(default_factory=list)
 
 class GraphNode(BaseModel):
     id: str
@@ -216,6 +221,49 @@ def build_journey_edges(symptom_timeline: List[str], candidates: List[dict]) -> 
 
     return edges
 
+
+def _build_local_demo_reply(
+    symptoms: List[str],
+    candidates: List[dict],
+    followup_questions: List[str],
+    red_flags: List[str],
+) -> str:
+    """Small deterministic fallback so school demos still work without Groq."""
+    if red_flags:
+        return (
+            "URGENT: I noticed possible red flag symptoms "
+            f"({', '.join(red_flags[:3])}). "
+            "Please seek emergency care immediately and contact a doctor now."
+        )
+
+    if not symptoms:
+        return (
+            "I can help you reason through symptoms. "
+            "Tell me your main discomfort and when it started."
+        )
+
+    if candidates:
+        top = candidates[0]
+        condition = top.get("display", "a possible condition")
+        severity = top.get("severity", "unknown")
+        question = (
+            f"Do you have {followup_questions[0]}?"
+            if followup_questions else
+            "Did these symptoms start suddenly or gradually?"
+        )
+        return (
+            f"Based on your symptoms ({', '.join(symptoms[:4])}), "
+            f"this may suggest {condition} (severity: {severity}). "
+            f"{question} Please consult a doctor for a proper diagnosis."
+        )
+
+    return (
+        f"I identified these symptoms: {', '.join(symptoms[:4])}. "
+        "I need one more detail to narrow this down: "
+        "is there fever, breathing difficulty, or persistent pain? "
+        "Please consult a doctor for a proper diagnosis."
+    )
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
@@ -249,11 +297,11 @@ async def chat(request: ChatRequest):
         journey_edges = build_journey_edges(all_symptoms, candidates)
 
         # --- Step 4: RAG retrieval ---
-        rag_context = RAG.retrieve_context(latest_user_msg, top_k=2)
-        rag_sources = [
-            doc["title"]
-            for doc in RAG.retrieve_raw(latest_user_msg, top_k=2)
-        ]
+        rag_docs = RAG.retrieve_raw(latest_user_msg, top_k=2)
+        rag_context = "\n\n---\n\n".join(
+            [f"[{doc['title']}]\n{doc['content']}" for doc in rag_docs]
+        )
+        rag_sources = [doc["title"] for doc in rag_docs]
 
         # --- Step 5: Build enriched system prompt ---
         system_prompt = build_system_prompt(
@@ -271,20 +319,30 @@ async def chat(request: ChatRequest):
             role = "user" if m.role == "user" else "assistant"
             messages.append({"role": role, "content": m.content})
 
-        try:
-            chat_completion = GROQ.chat.completions.create(
-                model="llama-3.1-8b-instant", 
-                messages=messages,
-                max_tokens=1000,
-                temperature=0.3,
+        if GROQ is None:
+            reply = _build_local_demo_reply(
+                symptoms=all_symptoms,
+                candidates=candidates,
+                followup_questions=followup_questions,
+                red_flags=red_flags,
             )
-            reply = chat_completion.choices[0].message.content
-        except Exception as e:
-            print(f"DEBUG: Groq API Error Detected: {e}")
-            if "429" in str(e) or "limit" in str(e).lower():
-                reply = "I'm sorry, I'm receiving too many requests from this account right now. Please try again soon."
-            else:
-                reply = f"I'm having trouble connecting to my reasoning engine. Error: {type(e).__name__}"
+        else:
+            try:
+                chat_completion = GROQ.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=messages,
+                    max_tokens=1000,
+                    temperature=0.3,
+                )
+                reply = chat_completion.choices[0].message.content
+            except Exception as e:
+                print(f"DEBUG: Groq API Error Detected: {e}")
+                reply = _build_local_demo_reply(
+                    symptoms=all_symptoms,
+                    candidates=candidates,
+                    followup_questions=followup_questions,
+                    red_flags=red_flags,
+                )
 
         return ChatResponse(
             reply=reply,
@@ -412,6 +470,41 @@ async def get_graph_data():
         ))
 
     return GraphData(nodes=nodes, edges=edges)
+
+
+# ---------------------------------------------------------------------------
+# Simple utility endpoints for demos
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "mode": "groq" if GROQ is not None else "local-demo",
+        "graph_nodes": GRAPH.number_of_nodes(),
+        "graph_edges": GRAPH.number_of_edges(),
+    }
+
+
+@app.get("/symptom-suggestions")
+async def symptom_suggestions(query: str = "", limit: int = 10):
+    """Return canonical symptom suggestions for quick classroom demos."""
+    q = (query or "").strip().lower()
+    if not q:
+        return {"query": "", "suggestions": []}
+
+    limit = max(1, min(limit, 25))
+    canonical = sorted(set(NLP.phrase_to_symptom.values()))
+
+    starts = [s for s in canonical if s.startswith(q)]
+    contains = [s for s in canonical if q in s and s not in starts]
+    suggestions = (starts + contains)[:limit]
+
+    return {
+        "query": q,
+        "suggestions": suggestions,
+        "count": len(suggestions),
+    }
 
 
 # ---------------------------------------------------------------------------
