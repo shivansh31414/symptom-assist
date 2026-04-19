@@ -100,19 +100,21 @@ class SemanticEmbeddingRetriever:
             f"{self.model_name} embeddings (dim={self.document_embeddings.shape[1]})"
         )
 
-    def retrieve(self, query: str, top_k: int = 3) -> list[dict]:
-        if not self.documents or self.document_embeddings.size == 0:
-            return []
-
+    def embed_query(self, query: str) -> np.ndarray:
         query_embedding = self.model.encode(
             [query],
             convert_to_numpy=True,
             normalize_embeddings=True,
             show_progress_bar=False,
         )
-        query_vector = np.asarray(query_embedding[0], dtype=np.float32)
+        return np.asarray(query_embedding[0], dtype=np.float32)
 
-        scores = self.document_embeddings @ query_vector
+    def _retrieve_from_vector(self, query_vector: np.ndarray, top_k: int = 3) -> list[dict]:
+        if not self.documents or self.document_embeddings.size == 0:
+            return []
+
+        normalized_query_vector = np.asarray(query_vector, dtype=np.float32)
+        scores = self.document_embeddings @ normalized_query_vector
         ranked_indices = np.argsort(scores)[::-1][:top_k]
 
         results: list[dict] = []
@@ -125,6 +127,20 @@ class SemanticEmbeddingRetriever:
             results.append(document)
 
         return results
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 3,
+        query_vector: np.ndarray | None = None,
+    ) -> list[dict]:
+        if not self.documents or self.document_embeddings.size == 0:
+            return []
+
+        if query_vector is None:
+            query_vector = self.embed_query(query)
+
+        return self._retrieve_from_vector(query_vector, top_k=top_k)
 
 
 # ---------------------------------------------------------------------------
