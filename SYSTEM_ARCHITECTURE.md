@@ -61,11 +61,11 @@ graph TD
     *   **Red Flag Logic**: Immediate detection of emergency symptoms (e.g., chest pain, difficulty breathing) that override normal conversation.
 
 ### 🔍 Grounding Layer (`app/core/rag_pipeline.py`)
-*   **Technology**: TF-IDF Vectorization (Custom Implementation).
+*   **Technology**: Sentence embeddings (`sentence-transformers`) + cosine similarity.
 *   **Role**: Prevents LLM hallucinations by providing curated medical text.
 *   **Process**:
-    1.  **Indexing**: Medical fact sheets for each supported condition are indexed at startup.
-    2.  **Retrieval**: The user's input is compared against the index to find the most relevant documentation.
+    1.  **Indexing**: Medical fact sheets for each supported condition are embedded at startup.
+    2.  **Retrieval**: The user's input is embedded and compared against the document vectors to find the most relevant documentation.
     3.  **Context Injection**: Snippets are injected into the LLM prompt so the AI "reads" the facts before speaking.
 
 ### ✂️ Extraction Layer (`app/core/nlp_extractor.py`)
