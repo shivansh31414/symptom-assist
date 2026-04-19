@@ -4,9 +4,10 @@ fastapi
 uvicorn[standard]
 python-dotenv
 networkx
+numpy
+sentence-transformers
 
-# For production-grade RAG (upgrade from TF-IDF):
-# sentence-transformers
+# Optional vector store if you want persistent ANN search later:
 # chromadb
 
 # For production-grade NLP (upgrade from keyword matching):

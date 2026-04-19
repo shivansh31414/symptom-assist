@@ -3,22 +3,30 @@ rag_pipeline.py
 ---------------
 RAG (Retrieval-Augmented Generation) pipeline for the symptom chatbot.
 
-Medical documents are now loaded from data/medical_docs.csv instead of
-being hardcoded. The TF-IDF retrieval engine is unchanged.
+This module loads curated medical documents from data/medical_docs.csv,
+builds dense embeddings with sentence-transformers, and uses cosine similarity
+to retrieve the most relevant context for the LLM prompt.
 
 Flow:
-  1. Load medical documents from CSV at startup
-  2. Build TF-IDF index
-  3. At query time, embed the user's symptom description
-  4. Retrieve top-k most relevant document chunks
-  5. Return chunks as context to inject into the LLM prompt
+    1. Load medical documents from CSV at startup
+    2. Embed each document with a sentence transformer model
+    3. Embed the user query at retrieval time
+    4. Score documents with cosine similarity in embedding space
+    5. Return the best matches as context for the LLM prompt
 """
 
 import csv
-import math
 import os
-import re
-from collections import defaultdict
+
+import numpy as np
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError as exc:  # pragma: no cover - dependency issue is environment-specific
+    raise ImportError(
+    "sentence-transformers is required for semantic retrieval. "
+    "Install dependencies with pip install -r requirements.txt."
+    ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -49,99 +57,90 @@ def load_documents_from_csv(csv_path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 2. TF-IDF vectoriser
+# 2. Semantic embedding retriever
 # ---------------------------------------------------------------------------
 
-class TFIDFRetriever:
-    def __init__(self):
-        self.documents   = []
-        self.vocab       = {}
-        self.idf         = {}
-        self.tfidf_matrix = []
+class SemanticEmbeddingRetriever:
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        self.model_name = model_name
+        self.model = SentenceTransformer(model_name)
+        self.documents: list[dict] = []
+        self.document_embeddings: np.ndarray = np.empty((0, 0), dtype=np.float32)
 
-    def _tokenize(self, text: str) -> list[str]:
-        text = text.lower()
-        text = re.sub(r"[^a-z0-9\s]", " ", text)
-        tokens = text.split()
-        stopwords = {
-            "the","a","an","is","are","was","were","be","been","being",
-            "have","has","had","do","does","did","will","would","could",
-            "should","may","might","shall","can","need","dare","ought",
-            "used","to","of","in","on","at","by","for","with","about",
-            "against","between","through","during","before","after",
-            "above","below","from","up","down","out","off","over","under",
-            "again","then","once","and","but","or","nor","so","yet",
-            "both","either","neither","not","no","nor","only","own",
-            "same","than","too","very","it","its","this","that","these",
-            "those","which","who","whom","what","when","where","why","how"
-        }
-        return [t for t in tokens if t not in stopwords and len(t) > 2]
-
-    def _tf(self, tokens: list[str]) -> dict:
-        tf: dict[str, int] = defaultdict(int)
-        for t in tokens:
-            tf[t] += 1
-        total = len(tokens) if tokens else 1
-        return {k: v / total for k, v in tf.items()}
+    def _document_text(self, document: dict) -> str:
+        return " ".join(
+            part
+            for part in [
+                document.get("title", ""),
+                document.get("condition", ""),
+                document.get("content", ""),
+            ]
+            if part
+        ).strip()
 
     def index(self, documents: list[dict]):
         self.documents = documents
-        tokenized = [self._tokenize(d["content"] + " " + d["title"]) for d in documents]
 
-        all_terms = set(t for doc in tokenized for t in doc)
-        self.vocab = {term: i for i, term in enumerate(sorted(all_terms))}
+        if not documents:
+            self.document_embeddings = np.empty((0, 0), dtype=np.float32)
+            print("[RAG] No medical documents found; semantic index is empty.")
+            return
 
-        N = len(documents)
-        df: dict[str, int] = defaultdict(int)
-        for doc_tokens in tokenized:
-            for term in set(doc_tokens):
-                df[term] += 1
-        self.idf = {
-            term: math.log((N + 1) / (df[term] + 1)) + 1
-            for term in self.vocab
-        }
+        corpus = [self._document_text(document) for document in documents]
+        embeddings = self.model.encode(
+            corpus,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        self.document_embeddings = np.asarray(embeddings, dtype=np.float32)
 
-        self.tfidf_matrix = []
-        for doc_tokens in tokenized:
-            tf = self._tf(doc_tokens)
-            vec = {
-                term: tf.get(term, 0) * self.idf.get(term, 0)
-                for term in self.vocab
-            }
-            self.tfidf_matrix.append(vec)
+        print(
+            f"[RAG] Indexed {len(documents)} documents using "
+            f"{self.model_name} embeddings (dim={self.document_embeddings.shape[1]})"
+        )
 
-        print(f"[RAG] Indexed {len(documents)} documents, vocab size: {len(self.vocab)}")
+    def embed_query(self, query: str) -> np.ndarray:
+        query_embedding = self.model.encode(
+            [query],
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return np.asarray(query_embedding[0], dtype=np.float32)
 
-    def _cosine_similarity(self, vec_a: dict, vec_b: dict) -> float:
-        common = set(vec_a.keys()) & set(vec_b.keys())
-        dot    = sum(vec_a[k] * vec_b[k] for k in common)
-        norm_a = math.sqrt(sum(v**2 for v in vec_a.values()))
-        norm_b = math.sqrt(sum(v**2 for v in vec_b.values()))
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot / (norm_a * norm_b)
+    def _retrieve_from_vector(self, query_vector: np.ndarray, top_k: int = 3) -> list[dict]:
+        if not self.documents or self.document_embeddings.size == 0:
+            return []
 
-    def retrieve(self, query: str, top_k: int = 3) -> list[dict]:
-        query_tokens = self._tokenize(query)
-        query_tf     = self._tf(query_tokens)
-        query_vec    = {
-            term: query_tf.get(term, 0) * self.idf.get(term, 0)
-            for term in self.vocab
-        }
+        normalized_query_vector = np.asarray(query_vector, dtype=np.float32)
+        scores = self.document_embeddings @ normalized_query_vector
+        ranked_indices = np.argsort(scores)[::-1][:top_k]
 
-        scores = []
-        for i, doc_vec in enumerate(self.tfidf_matrix):
-            score = self._cosine_similarity(query_vec, doc_vec)
-            scores.append((score, i))
+        results: list[dict] = []
+        for index in ranked_indices:
+            score = float(scores[index])
+            if score <= 0:
+                continue
+            document = self.documents[int(index)].copy()
+            document["relevance_score"] = round(score, 4)
+            results.append(document)
 
-        scores.sort(reverse=True)
-        results = []
-        for score, idx in scores[:top_k]:
-            if score > 0:
-                doc = self.documents[idx].copy()
-                doc["relevance_score"] = round(score, 4)
-                results.append(doc)
         return results
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 3,
+        query_vector: np.ndarray | None = None,
+    ) -> list[dict]:
+        if not self.documents or self.document_embeddings.size == 0:
+            return []
+
+        if query_vector is None:
+            query_vector = self.embed_query(query)
+
+        return self._retrieve_from_vector(query_vector, top_k=top_k)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +156,7 @@ class RAGPipeline:
             documents = []
             print("[RAG] WARNING: no medical_docs.csv found; RAG context will be empty.")
 
-        self.retriever = TFIDFRetriever()
+        self.retriever = SemanticEmbeddingRetriever()
         self.retriever.index(documents)
 
     def retrieve_context(self, query: str, top_k: int = 3) -> str:
